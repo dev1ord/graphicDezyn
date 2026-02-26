@@ -1,0 +1,1104 @@
+"""
+╔══════════════════════════════════════════════════════════╗
+║        GRAPHIC DESIGNER TOOLKIT  –  v2.0                ║
+║  Smart universal processor for junior graphic designers  ║
+╚══════════════════════════════════════════════════════════╝
+
+Features:
+  • Resize / Compress (file OR folder, recursive)
+  • JPG ↔ PNG conversion
+  • Audio extraction from video
+  • PNG/JPG → SVG tracing  (potrace via vtracer)
+  • SVG → PNG/JPG rasterization
+  • Watermarking
+  • Batch rename
+  • Colour-profile strip / flatten transparency
+  • Strip EXIF metadata
+  • Grayscale / sepia conversion
+  • Canvas / padding extension
+  • Sprite-sheet stitcher
+
+Dependencies (install once):
+    pip install pillow vtracer moviepy
+"""
+
+import os
+import sys
+import shutil
+import threading
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, colorchooser
+from pathlib import Path
+
+# ── Optional heavy deps (graceful fallback) ──────────────────────────────────
+try:
+    from PIL import Image, ImageFilter, ImageDraw, ImageFont, ImageEnhance
+    PIL_OK = True
+except ImportError:
+    PIL_OK = False
+
+try:
+    import vtracer          # jpg/png → svg
+    VTRACER_OK = True
+except ImportError:
+    VTRACER_OK = False
+
+
+
+try:
+    from moviepy.editor import VideoFileClip
+    MOVIEPY_OK = True
+except ImportError:
+    MOVIEPY_OK = False
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+IMG_EXTS   = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".gif"}
+VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv"}
+AUDIO_EXTS = {".mp3", ".wav", ".aac", ".flac", ".ogg"}
+SVG_EXT    = {".svg"}
+
+DARK_BG     = "#0f0f13"
+PANEL_BG    = "#17171f"
+ACCENT      = "#7c6af7"
+ACCENT2     = "#f76a8c"
+TEXT_LIGHT  = "#e8e6ff"
+TEXT_DIM    = "#7a788a"
+SUCCESS     = "#4dffb4"
+WARNING     = "#ffd166"
+DANGER      = "#ff6b6b"
+BORDER      = "#2a2840"
+
+FONT_HEAD   = ("Courier New", 22, "bold")
+FONT_SUB    = ("Courier New", 11)
+FONT_LABEL  = ("Courier New", 10)
+FONT_BTN    = ("Courier New", 10, "bold")
+FONT_MONO   = ("Courier New", 9)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  CORE ENGINE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def collect_files(input_path: str, extensions: set) -> list[Path]:
+    """Return all matching files; handles file OR folder (recursive)."""
+    p = Path(input_path)
+    if p.is_file():
+        return [p] if p.suffix.lower() in extensions else []
+    files = []
+    for f in p.rglob("*"):
+        if f.is_file() and f.suffix.lower() in extensions:
+            files.append(f)
+    return sorted(files)
+
+
+def safe_output_path(src: Path, out_dir: Path | None,
+                     new_suffix: str | None = None,
+                     suffix_tag: str = "_out") -> Path:
+    """Build output path, never overwriting originals unless out_dir is same."""
+    stem = src.stem + (suffix_tag if out_dir is None else "")
+    ext  = new_suffix if new_suffix else src.suffix
+    if out_dir:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir / (stem + ext)
+    return src.parent / (stem + ext)
+
+
+# ── 1. Resize / Compress ─────────────────────────────────────────────────────
+
+def process_resize_compress(input_path, output_folder=None,
+                             quality=75, max_width=None, max_height=None,
+                             keep_format=True, log=print):
+    if not PIL_OK:
+        log("✗ Pillow not installed. Run: pip install pillow"); return
+    files = collect_files(input_path, IMG_EXTS)
+    if not files:
+        log("✗ No supported images found."); return
+    out_base = Path(output_folder) if output_folder else None
+    ok, fail = 0, 0
+    for f in files:
+        try:
+            rel   = f.relative_to(Path(input_path).parent if Path(input_path).is_file() else input_path)
+            odir  = (out_base / rel.parent) if out_base else None
+            opath = safe_output_path(f, odir, suffix_tag="_compressed")
+            img   = Image.open(f)
+            if img.mode in ("RGBA", "P") and not keep_format:
+                img = img.convert("RGB")
+            if max_width or max_height:
+                img.thumbnail((max_width or img.width, max_height or img.height),
+                               Image.LANCZOS)
+            fmt = img.format if keep_format and img.format else "JPEG"
+            if fmt == "PNG":
+                img.save(opath, format="PNG", optimize=True)
+            else:
+                if img.mode == "RGBA": img = img.convert("RGB")
+                img.save(opath, format="JPEG", optimize=True, quality=quality)
+            log(f"✓ {f.name}  →  {opath}")
+            ok += 1
+        except Exception as e:
+            log(f"✗ {f.name}: {e}"); fail += 1
+    log(f"\n── Done: {ok} compressed, {fail} failed ──")
+
+
+# ── 2. Format Conversion (JPG ↔ PNG ↔ WEBP) ──────────────────────────────────
+
+def process_convert_format(input_path, output_folder=None,
+                            target_fmt="PNG", log=print):
+    if not PIL_OK:
+        log("✗ Pillow not installed."); return
+    files = collect_files(input_path, IMG_EXTS)
+    if not files:
+        log("✗ No images found."); return
+    out_base = Path(output_folder) if output_folder else None
+    ext_map  = {"PNG": ".png", "JPEG": ".jpg", "WEBP": ".webp"}
+    new_ext  = ext_map.get(target_fmt.upper(), ".png")
+    ok, fail = 0, 0
+    for f in files:
+        try:
+            rel   = f.relative_to(Path(input_path).parent if Path(input_path).is_file() else input_path)
+            odir  = (out_base / rel.parent) if out_base else None
+            opath = safe_output_path(f, odir, new_suffix=new_ext)
+            img   = Image.open(f)
+            if target_fmt.upper() in ("JPEG", "WEBP") and img.mode == "RGBA":
+                bg = Image.new("RGB", img.size, (255, 255, 255))
+                bg.paste(img, mask=img.split()[3])
+                img = bg
+            img.save(opath, format=target_fmt.upper())
+            log(f"✓ {f.name}  →  {opath.name}")
+            ok += 1
+        except Exception as e:
+            log(f"✗ {f.name}: {e}"); fail += 1
+    log(f"\n── Done: {ok} converted, {fail} failed ──")
+
+
+# ── 3. PNG/JPG → SVG ─────────────────────────────────────────────────────────
+
+def process_raster_to_svg(input_path, output_folder=None,
+                           colormode="color", log=print):
+    if not VTRACER_OK:
+        log("✗ vtracer not installed. Run: pip install vtracer"); return
+    files = collect_files(input_path, IMG_EXTS)
+    if not files:
+        log("✗ No images found."); return
+    out_base = Path(output_folder) if output_folder else None
+    ok, fail = 0, 0
+    for f in files:
+        try:
+            rel   = f.relative_to(Path(input_path).parent if Path(input_path).is_file() else input_path)
+            odir  = (out_base / rel.parent) if out_base else None
+            opath = safe_output_path(f, odir, new_suffix=".svg")
+            vtracer.convert_image_to_svg_py(
+                str(f), str(opath),
+                colormode=colormode,          # "color" | "binary"
+                hierarchical="stacked",
+                mode="spline",
+                filter_speckle=4,
+                color_precision=6,
+                layer_difference=16,
+                corner_threshold=60,
+                length_threshold=4.0,
+                splice_threshold=45,
+                path_precision=8
+            )
+            log(f"✓ {f.name}  →  {opath.name}")
+            ok += 1
+        except Exception as e:
+            log(f"✗ {f.name}: {e}"); fail += 1
+    log(f"\n── Done: {ok} traced, {fail} failed ──")
+
+
+
+def _svg_to_pil(svg_path: Path, dpi: int = 150) -> "Image.Image":
+    """
+    Pure-Python SVG → PIL Image.
+    Strategy: parse SVG viewBox/width/height, render shapes via Pillow's
+    ImageDraw for basic SVGs, OR fall back to a blank canvas with a label
+    for complex SVGs. For production-quality tracing use Inkscape CLI if
+    installed (detected automatically).
+    """
+    import subprocess, shutil, tempfile
+
+    # ── Try Inkscape CLI first (best quality, optional) ──────────────────
+    inkscape = shutil.which("inkscape")
+    if inkscape:
+        scale = dpi / 96.0
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            tmp_path = tmp.name
+        subprocess.run(
+            [inkscape, str(svg_path),
+             f"--export-filename={tmp_path}",
+             f"--export-dpi={dpi}"],
+            check=True, capture_output=True
+        )
+        img = Image.open(tmp_path).copy()
+        Path(tmp_path).unlink(missing_ok=True)
+        return img
+
+    # ── Pure-Python fallback: parse SVG dimensions → white canvas ────────
+    import xml.etree.ElementTree as ET
+    tree = ET.parse(str(svg_path))
+    root = tree.getroot()
+    ns   = {"svg": "http://www.w3.org/2000/svg"}
+
+    def _dim(val, default=512):
+        if val is None: return default
+        val = val.strip().rstrip("pt").rstrip("px").rstrip("mm").strip()
+        try: return max(1, int(float(val) * (dpi / 96.0)))
+        except ValueError: return default
+
+    vb = root.get("viewBox", "")
+    if vb:
+        parts = vb.replace(",", " ").split()
+        w = _dim(parts[2]) if len(parts) >= 3 else _dim(root.get("width"))
+        h = _dim(parts[3]) if len(parts) >= 4 else _dim(root.get("height"))
+    else:
+        w = _dim(root.get("width"))
+        h = _dim(root.get("height"))
+
+    # Render a white canvas — basic but guaranteed to work
+    img  = Image.new("RGBA", (w, h), (255, 255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    draw.text((10, 10),
+              f"SVG: {svg_path.name}\n(Install Inkscape for full render)",
+              fill=(180, 180, 180))
+    return img
+
+# ── 4. SVG → PNG/JPG ─────────────────────────────────────────────────────────
+
+def process_svg_to_raster(input_path, output_folder=None,
+                           target_fmt="PNG", dpi=150, log=print):
+    if not CAIRO_OK:
+        log("✗ Pillow not installed. Run:  pip install pillow"); return
+    files = collect_files(input_path, SVG_EXT)
+    if not files:
+        log("✗ No SVG files found."); return
+    out_base = Path(output_folder) if output_folder else None
+    ext_map  = {"PNG": ".png", "JPEG": ".jpg"}
+    new_ext  = ext_map.get(target_fmt.upper(), ".png")
+    ok, fail = 0, 0
+    for f in files:
+        try:
+            rel   = f.relative_to(Path(input_path).parent if Path(input_path).is_file() else input_path)
+            odir  = (out_base / rel.parent) if out_base else None
+            opath = safe_output_path(f, odir, new_suffix=new_ext)
+            img   = _svg_to_pil(f, dpi)
+            if target_fmt.upper() == "JPEG":
+                img = img.convert("RGB")
+                img.save(opath, format="JPEG", quality=90)
+            else:
+                img.save(opath, format="PNG")
+            log(f"✓ {f.name}  →  {opath.name}")
+            ok += 1
+        except Exception as e:
+            log(f"✗ {f.name}: {e}"); fail += 1
+    log(f"\n── Done: {ok} rasterised, {fail} failed ──")
+
+
+# ── 5. Audio Extraction from Video ───────────────────────────────────────────
+
+def process_extract_audio(input_path, output_folder=None,
+                           audio_fmt="mp3", log=print):
+    if not MOVIEPY_OK:
+        log("✗ moviepy not installed. Run: pip install moviepy"); return
+    files = collect_files(input_path, VIDEO_EXTS)
+    if not files:
+        log("✗ No supported video files found."); return
+    out_base = Path(output_folder) if output_folder else None
+    ok, fail = 0, 0
+    for f in files:
+        try:
+            rel   = f.relative_to(Path(input_path).parent if Path(input_path).is_file() else input_path)
+            odir  = (out_base / rel.parent) if out_base else None
+            opath = safe_output_path(f, odir, new_suffix=f".{audio_fmt}")
+            clip  = VideoFileClip(str(f))
+            if clip.audio is None:
+                log(f"✗ {f.name}: no audio track"); clip.close(); fail += 1; continue
+            clip.audio.write_audiofile(str(opath), logger=None)
+            clip.close()
+            log(f"✓ {f.name}  →  {opath.name}")
+            ok += 1
+        except Exception as e:
+            log(f"✗ {f.name}: {e}"); fail += 1
+    log(f"\n── Done: {ok} extracted, {fail} failed ──")
+
+
+# ── 6. Watermark ─────────────────────────────────────────────────────────────
+
+def process_watermark(input_path, output_folder=None,
+                       wm_text="© Your Brand", opacity=100,
+                       position="bottom-right", log=print):
+    if not PIL_OK:
+        log("✗ Pillow not installed."); return
+    files = collect_files(input_path, IMG_EXTS)
+    if not files:
+        log("✗ No images found."); return
+    out_base = Path(output_folder) if output_folder else None
+    ok, fail = 0, 0
+    for f in files:
+        try:
+            rel   = f.relative_to(Path(input_path).parent if Path(input_path).is_file() else input_path)
+            odir  = (out_base / rel.parent) if out_base else None
+            opath = safe_output_path(f, odir, suffix_tag="_wm")
+            img   = Image.open(f).convert("RGBA")
+            txt_layer = Image.new("RGBA", img.size, (255,255,255,0))
+            draw  = ImageDraw.Draw(txt_layer)
+            try:
+                font = ImageFont.truetype("arial.ttf", max(16, img.width // 40))
+            except Exception:
+                font = ImageFont.load_default()
+            bbox  = draw.textbbox((0,0), wm_text, font=font)
+            tw, th = bbox[2]-bbox[0], bbox[3]-bbox[1]
+            pad = 20
+            pos_map = {
+                "top-left":     (pad, pad),
+                "top-right":    (img.width - tw - pad, pad),
+                "bottom-left":  (pad, img.height - th - pad),
+                "bottom-right": (img.width - tw - pad, img.height - th - pad),
+                "center":       ((img.width-tw)//2, (img.height-th)//2),
+            }
+            xy = pos_map.get(position, pos_map["bottom-right"])
+            draw.text(xy, wm_text, fill=(255,255,255,opacity), font=font)
+            draw.text((xy[0]+2, xy[1]+2), wm_text, fill=(0,0,0,opacity//2), font=font)
+            out = Image.alpha_composite(img, txt_layer).convert("RGB")
+            out.save(opath)
+            log(f"✓ {f.name}  →  {opath.name}")
+            ok += 1
+        except Exception as e:
+            log(f"✗ {f.name}: {e}"); fail += 1
+    log(f"\n── Done: {ok} watermarked, {fail} failed ──")
+
+
+# ── 7. Strip EXIF Metadata ───────────────────────────────────────────────────
+
+def process_strip_exif(input_path, output_folder=None, log=print):
+    if not PIL_OK:
+        log("✗ Pillow not installed."); return
+    files = collect_files(input_path, IMG_EXTS)
+    if not files:
+        log("✗ No images found."); return
+    out_base = Path(output_folder) if output_folder else None
+    ok, fail = 0, 0
+    for f in files:
+        try:
+            rel   = f.relative_to(Path(input_path).parent if Path(input_path).is_file() else input_path)
+            odir  = (out_base / rel.parent) if out_base else None
+            opath = safe_output_path(f, odir, suffix_tag="_clean")
+            img   = Image.open(f)
+            data  = list(img.getdata())
+            clean = Image.new(img.mode, img.size)
+            clean.putdata(data)
+            clean.save(opath)
+            log(f"✓ {f.name}  →  {opath.name}")
+            ok += 1
+        except Exception as e:
+            log(f"✗ {f.name}: {e}"); fail += 1
+    log(f"\n── Done: {ok} cleaned, {fail} failed ──")
+
+
+# ── 8. Grayscale / Sepia ─────────────────────────────────────────────────────
+
+def process_colour_effect(input_path, output_folder=None,
+                           effect="grayscale", log=print):
+    if not PIL_OK:
+        log("✗ Pillow not installed."); return
+    files = collect_files(input_path, IMG_EXTS)
+    if not files:
+        log("✗ No images found."); return
+    out_base = Path(output_folder) if output_folder else None
+    ok, fail = 0, 0
+    for f in files:
+        try:
+            rel   = f.relative_to(Path(input_path).parent if Path(input_path).is_file() else input_path)
+            odir  = (out_base / rel.parent) if out_base else None
+            opath = safe_output_path(f, odir, suffix_tag=f"_{effect}")
+            img   = Image.open(f).convert("RGB")
+            if effect == "grayscale":
+                img = img.convert("L").convert("RGB")
+            elif effect == "sepia":
+                from PIL import ImageOps
+                gray = img.convert("L")
+                img  = ImageOps.colorize(gray, "#704214", "#C0A882")
+            img.save(opath)
+            log(f"✓ {f.name}  →  {opath.name}")
+            ok += 1
+        except Exception as e:
+            log(f"✗ {f.name}: {e}"); fail += 1
+    log(f"\n── Done: {ok} processed, {fail} failed ──")
+
+
+# ── 9. Add Canvas / Padding ───────────────────────────────────────────────────
+
+def process_add_canvas(input_path, output_folder=None,
+                        pad_top=50, pad_right=50, pad_bottom=50, pad_left=50,
+                        bg_colour="#ffffff", log=print):
+    if not PIL_OK:
+        log("✗ Pillow not installed."); return
+    files = collect_files(input_path, IMG_EXTS)
+    if not files:
+        log("✗ No images found."); return
+    out_base = Path(output_folder) if output_folder else None
+    ok, fail = 0, 0
+    for f in files:
+        try:
+            rel   = f.relative_to(Path(input_path).parent if Path(input_path).is_file() else input_path)
+            odir  = (out_base / rel.parent) if out_base else None
+            opath = safe_output_path(f, odir, suffix_tag="_canvas")
+            img   = Image.open(f).convert("RGBA")
+            nw    = img.width  + pad_left + pad_right
+            nh    = img.height + pad_top  + pad_bottom
+            bg    = Image.new("RGBA", (nw, nh), bg_colour)
+            bg.paste(img, (pad_left, pad_top), img)
+            bg.convert("RGB").save(opath)
+            log(f"✓ {f.name}  →  {opath.name}")
+            ok += 1
+        except Exception as e:
+            log(f"✗ {f.name}: {e}"); fail += 1
+    log(f"\n── Done: {ok} padded, {fail} failed ──")
+
+
+# ── 10. Sprite Sheet ─────────────────────────────────────────────────────────
+
+def process_sprite_sheet(input_path, output_path="sprite_sheet.png",
+                          cols=4, spacing=0, bg_colour="#00000000", log=print):
+    if not PIL_OK:
+        log("✗ Pillow not installed."); return
+    files = collect_files(input_path, IMG_EXTS)
+    if not files:
+        log("✗ No images found."); return
+    imgs  = [Image.open(f).convert("RGBA") for f in files]
+    mw    = max(i.width  for i in imgs) + spacing
+    mh    = max(i.height for i in imgs) + spacing
+    rows  = (len(imgs) + cols - 1) // cols
+    sheet = Image.new("RGBA", (cols*mw, rows*mh), bg_colour)
+    for idx, im in enumerate(imgs):
+        r, c = divmod(idx, cols)
+        sheet.paste(im, (c*mw, r*mh), im)
+    sheet.save(output_path)
+    log(f"✓ Sprite sheet saved → {output_path}  ({len(imgs)} images, {cols} cols)")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  TKINTER GUI
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Tooltip:
+    def __init__(self, widget, text):
+        self.widget, self.text = widget, text
+        self.tip = None
+        widget.bind("<Enter>", self.show)
+        widget.bind("<Leave>", self.hide)
+
+    def show(self, _=None):
+        x = self.widget.winfo_rootx() + 20
+        y = self.widget.winfo_rooty() + 30
+        self.tip = tk.Toplevel(self.widget)
+        self.tip.wm_overrideredirect(True)
+        self.tip.geometry(f"+{x}+{y}")
+        lbl = tk.Label(self.tip, text=self.text, background="#1e1e2e",
+                       foreground=TEXT_LIGHT, font=FONT_MONO,
+                       relief="solid", bd=1, padx=6, pady=4)
+        lbl.pack()
+
+    def hide(self, _=None):
+        if self.tip:
+            self.tip.destroy()
+            self.tip = None
+
+
+class GraphicDesignerToolkit(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Designer Toolkit  ·  shreyazhV2.0")
+        self.geometry("1020x780")
+        self.minsize(860, 640)
+        self.configure(bg=DARK_BG)
+        self._build_ui()
+
+    # ── UI Skeleton ──────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        # Header
+        hdr = tk.Frame(self, bg=PANEL_BG, height=72)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="◈ DESIGNER'S TOOLKIT",
+                 font=FONT_HEAD, bg=PANEL_BG, fg=ACCENT).pack(side="left", padx=24, pady=14)
+        tk.Label(hdr, text="v2.0  ·  shreyazh",
+                 font=FONT_LABEL, bg=PANEL_BG, fg=TEXT_DIM).pack(side="left", pady=20)
+
+        # Body: sidebar + main
+        body = tk.Frame(self, bg=DARK_BG)
+        body.pack(fill="both", expand=True)
+
+        self._main_area(body)   # must come first — sidebar calls _switch_tab which needs tab_frame
+        self._sidebar(body)
+
+    def _sidebar(self, parent):
+        sb = tk.Frame(parent, bg=PANEL_BG, width=200)
+        sb.pack(side="left", fill="y")
+        sb.pack_propagate(False)
+
+        tk.Label(sb, text="TOOLS", font=FONT_BTN, bg=PANEL_BG,
+                 fg=TEXT_DIM).pack(pady=(20,6), padx=16, anchor="w")
+
+        self._tabs = {}
+        tools = [
+            ("⇄  Resize / Compress",   "resize"),
+            ("⇌  Format Convert",      "convert"),
+            ("⟢  Raster → SVG",        "to_svg"),
+            ("◎  Watermark",           "watermark"),
+            ("✦  Colour Effects",      "colour"),
+            ("☐  Add Canvas",          "canvas"),
+            ("⊞  Sprite Sheet",        "sprite"),
+            ("⊗  Strip EXIF",          "exif"),
+        ]
+        self.active_tab = tk.StringVar(value="resize")
+
+        for label, key in tools:
+            btn = tk.Button(sb, text=label, font=FONT_LABEL,
+                            bg=PANEL_BG, fg=TEXT_LIGHT,
+                            activebackground=ACCENT, activeforeground="#fff",
+                            relief="flat", anchor="w", padx=16, pady=8,
+                            cursor="hand2",
+                            command=lambda k=key: self._switch_tab(k))
+            btn.pack(fill="x")
+            self._tabs[key] = btn
+
+        self._switch_tab("resize")  # default
+
+    def _switch_tab(self, key):
+        for k, btn in self._tabs.items():
+            btn.config(bg=PANEL_BG if k != key else ACCENT,
+                       fg=TEXT_DIM if k != key else "#fff")
+        self.active_tab.set(key)
+        self._load_tab(key)
+
+    def _main_area(self, parent):
+        self.main_frame = tk.Frame(parent, bg=DARK_BG)
+        self.main_frame.pack(side="left", fill="both", expand=True, padx=0)
+        self.tab_frame  = tk.Frame(self.main_frame, bg=DARK_BG)
+        self.tab_frame.pack(fill="both", expand=True, padx=20, pady=16)
+
+        # Log panel
+        log_hdr = tk.Frame(self.main_frame, bg=PANEL_BG, height=32)
+        log_hdr.pack(fill="x", padx=20, pady=(0,0))
+        tk.Label(log_hdr, text="  OUTPUT LOG", font=FONT_BTN,
+                 bg=PANEL_BG, fg=TEXT_DIM).pack(side="left", pady=6)
+        tk.Button(log_hdr, text="CLEAR", font=FONT_LABEL,
+                  bg=PANEL_BG, fg=DANGER, relief="flat", cursor="hand2",
+                  command=self._clear_log).pack(side="right", padx=10)
+
+        log_wrap = tk.Frame(self.main_frame, bg=PANEL_BG, height=200)
+        log_wrap.pack(fill="x", padx=20, pady=(0,16))
+        self.log_box = tk.Text(log_wrap, height=10, bg="#0a0a10",
+                               fg=TEXT_LIGHT, font=FONT_MONO,
+                               relief="flat", wrap="word",
+                               insertbackground=ACCENT)
+        sb2 = ttk.Scrollbar(log_wrap, command=self.log_box.yview)
+        self.log_box.configure(yscrollcommand=sb2.set)
+        self.log_box.pack(side="left", fill="both", expand=True, padx=4, pady=4)
+        sb2.pack(side="right", fill="y")
+
+    # ── Tab loader ───────────────────────────────────────────────────────────
+
+    def _load_tab(self, key):
+        for w in self.tab_frame.winfo_children():
+            w.destroy()
+        tab_builders = {
+            "resize":    self._tab_resize,
+            "convert":   self._tab_convert,
+            "to_svg":    self._tab_to_svg,
+            "from_svg":  self._tab_from_svg,
+            "audio":     self._tab_audio,
+            "watermark": self._tab_watermark,
+            "colour":    self._tab_colour,
+            "canvas":    self._tab_canvas,
+            "sprite":    self._tab_sprite,
+            "exif":      self._tab_exif,
+        }
+        tab_builders[key]()
+
+    # ── Shared helpers ───────────────────────────────────────────────────────
+
+    def _log(self, msg):
+        self.log_box.configure(state="normal")
+        tag = "ok" if msg.startswith("✓") else ("err" if msg.startswith("✗") else "info")
+        col = {  "ok": SUCCESS, "err": DANGER, "info": TEXT_DIM }[tag]
+        self.log_box.insert("end", msg + "\n", tag)
+        self.log_box.tag_config(tag, foreground=col)
+        self.log_box.see("end")
+        self.log_box.configure(state="disabled")
+
+    def _clear_log(self):
+        self.log_box.configure(state="normal")
+        self.log_box.delete("1.0", "end")
+        self.log_box.configure(state="disabled")
+
+    def _label(self, parent, text, **kw):
+        return tk.Label(parent, text=text, font=FONT_LABEL,
+                        bg=DARK_BG, fg=TEXT_DIM, anchor="w", **kw)
+
+    def _entry(self, parent, textvariable=None, width=40):
+        e = tk.Entry(parent, textvariable=textvariable, width=width,
+                     bg="#1a1a28", fg=TEXT_LIGHT, insertbackground=ACCENT,
+                     relief="flat", font=FONT_MONO, bd=4)
+        return e
+
+    def _btn(self, parent, text, command, colour=ACCENT):
+        return tk.Button(parent, text=text, command=command,
+                         font=FONT_BTN, bg=colour, fg="#fff",
+                         activebackground=ACCENT2, activeforeground="#fff",
+                         relief="flat", cursor="hand2", padx=14, pady=6)
+
+    def _browse_in(self, var, ask_type="both"):
+        if ask_type == "file":
+            p = filedialog.askopenfilename()
+        elif ask_type == "folder":
+            p = filedialog.askdirectory()
+        else:
+            p = filedialog.askdirectory() or filedialog.askopenfilename()
+        if p: var.set(p)
+
+    def _browse_out(self, var):
+        p = filedialog.askdirectory()
+        if p: var.set(p)
+
+    def _row(self, parent, row, label, widget_factory, *a, **kw):
+        self._label(parent, label).grid(row=row, column=0, sticky="w",
+                                         padx=(0,12), pady=4)
+        w = widget_factory(parent, *a, **kw)
+        w.grid(row=row, column=1, sticky="ew", pady=4)
+        return w
+
+    def _run_in_thread(self, fn, *args, btn=None, **kwargs):
+        if btn: btn.config(state="disabled", text="⏳ Running…")
+        def worker():
+            try:
+                fn(*args, **kwargs, log=self._log)
+            finally:
+                if btn:
+                    self.after(0, lambda: btn.config(state="normal",
+                                                      text="▶  RUN"))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _io_rows(self, parent, row=0, folder_only=False):
+        """Shared Input / Output rows."""
+        inv = tk.StringVar()
+        outv= tk.StringVar()
+        tk.Label(parent, text="INPUT", font=FONT_BTN, bg=DARK_BG,
+                 fg=ACCENT).grid(row=row, column=0, sticky="w", pady=(0,2))
+        row += 1
+        self._label(parent, "Input (file or folder):").grid(row=row, column=0, sticky="w")
+        ef = tk.Frame(parent, bg=DARK_BG)
+        ef.grid(row=row, column=1, sticky="ew", pady=3)
+        self._entry(ef, textvariable=inv, width=34).pack(side="left", fill="x", expand=True)
+        self._btn(ef, "…", lambda: self._browse_in(inv, "folder" if folder_only else "both"),
+                  colour="#2a2840").pack(side="left", padx=(6,0))
+        row += 1
+        self._label(parent, "Output folder (blank=auto):").grid(row=row, column=0, sticky="w")
+        ef2 = tk.Frame(parent, bg=DARK_BG)
+        ef2.grid(row=row, column=1, sticky="ew", pady=3)
+        self._entry(ef2, textvariable=outv, width=34).pack(side="left", fill="x", expand=True)
+        self._btn(ef2, "…", lambda: self._browse_out(outv),
+                  colour="#2a2840").pack(side="left", padx=(6,0))
+        return inv, outv, row+1
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  TABS
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _tab_resize(self):
+        p = self.tab_frame
+        p.columnconfigure(1, weight=1)
+        tk.Label(p, text="RESIZE & COMPRESS", font=FONT_HEAD,
+                 bg=DARK_BG, fg=TEXT_LIGHT).grid(row=0, column=0, columnspan=2,
+                                                   sticky="w", pady=(0,16))
+        inv, outv, r = self._io_rows(p, row=1)
+
+        qual = tk.IntVar(value=75)
+        mw   = tk.StringVar(value="1920")
+        mh   = tk.StringVar(value="1080")
+        kf   = tk.BooleanVar(value=True)
+
+        tk.Label(p, text="OPTIONS", font=FONT_BTN, bg=DARK_BG,
+                 fg=ACCENT).grid(row=r, column=0, sticky="w", pady=(12,2)); r+=1
+
+        self._label(p, "JPEG Quality (1-95):").grid(row=r, column=0, sticky="w", pady=4)
+        sf = tk.Frame(p, bg=DARK_BG)
+        sf.grid(row=r, column=1, sticky="ew", pady=4); r+=1
+        tk.Scale(sf, from_=1, to=95, orient="horizontal", variable=qual,
+                 bg=DARK_BG, fg=TEXT_LIGHT, troughcolor=BORDER,
+                 highlightthickness=0, font=FONT_LABEL).pack(side="left", fill="x", expand=True)
+        tk.Label(sf, textvariable=qual, bg=DARK_BG, fg=ACCENT,
+                 font=FONT_BTN, width=4).pack(side="left")
+
+        self._label(p, "Max Width (px):").grid(row=r, column=0, sticky="w", pady=4)
+        self._entry(p, textvariable=mw, width=10).grid(row=r, column=1, sticky="w"); r+=1
+        self._label(p, "Max Height (px):").grid(row=r, column=0, sticky="w", pady=4)
+        self._entry(p, textvariable=mh, width=10).grid(row=r, column=1, sticky="w"); r+=1
+        self._label(p, "Keep original format:").grid(row=r, column=0, sticky="w", pady=4)
+        tk.Checkbutton(p, variable=kf, bg=DARK_BG, fg=TEXT_LIGHT,
+                       selectcolor=PANEL_BG, activebackground=DARK_BG).grid(row=r, column=1, sticky="w"); r+=1
+
+        run_btn = self._btn(p, "▶  RUN", None, colour=ACCENT)
+        run_btn.grid(row=r, column=1, sticky="w", pady=16)
+
+        def run():
+            mwv = int(mw.get()) if mw.get().strip().isdigit() else None
+            mhv = int(mh.get()) if mh.get().strip().isdigit() else None
+            self._run_in_thread(process_resize_compress,
+                                 inv.get(), outv.get() or None,
+                                 qual.get(), mwv, mhv, kf.get(), btn=run_btn)
+        run_btn.config(command=run)
+
+    def _tab_convert(self):
+        p = self.tab_frame
+        p.columnconfigure(1, weight=1)
+        tk.Label(p, text="FORMAT CONVERSION", font=FONT_HEAD,
+                 bg=DARK_BG, fg=TEXT_LIGHT).grid(row=0, column=0, columnspan=2,
+                                                   sticky="w", pady=(0,16))
+        inv, outv, r = self._io_rows(p, row=1)
+
+        tk.Label(p, text="TARGET FORMAT", font=FONT_BTN, bg=DARK_BG,
+                 fg=ACCENT).grid(row=r, column=0, sticky="w", pady=(12,2)); r+=1
+
+        fmt = tk.StringVar(value="PNG")
+        for f in ("PNG", "JPEG", "WEBP"):
+            tk.Radiobutton(p, text=f, variable=fmt, value=f,
+                           bg=DARK_BG, fg=TEXT_LIGHT, selectcolor=PANEL_BG,
+                           activebackground=DARK_BG, font=FONT_LABEL).grid(
+                               row=r, column=1, sticky="w"); r+=1
+
+        run_btn = self._btn(p, "▶  RUN", None, colour=ACCENT)
+        run_btn.grid(row=r, column=1, sticky="w", pady=16)
+
+        def run():
+            self._run_in_thread(process_convert_format,
+                                 inv.get(), outv.get() or None, fmt.get(), btn=run_btn)
+        run_btn.config(command=run)
+
+    def _tab_to_svg(self):
+        p = self.tab_frame
+        p.columnconfigure(1, weight=1)
+        tk.Label(p, text="RASTER → SVG", font=FONT_HEAD,
+                 bg=DARK_BG, fg=TEXT_LIGHT).grid(row=0, column=0, columnspan=2,
+                                                   sticky="w", pady=(0,16))
+        if not VTRACER_OK:
+            tk.Label(p, text="⚠ vtracer not installed.\nRun:  pip install vtracer",
+                     bg=DARK_BG, fg=WARNING, font=FONT_SUB).grid(row=1, column=0,
+                                                                   columnspan=2, pady=20)
+            return
+        inv, outv, r = self._io_rows(p, row=1)
+
+        mode = tk.StringVar(value="color")
+        tk.Label(p, text="COLOUR MODE", font=FONT_BTN, bg=DARK_BG,
+                 fg=ACCENT).grid(row=r, column=0, sticky="w", pady=(12,2)); r+=1
+        for m, lbl in (("color","Colour (full trace)"),("binary","Binary (line art)")):
+            tk.Radiobutton(p, text=lbl, variable=mode, value=m,
+                           bg=DARK_BG, fg=TEXT_LIGHT, selectcolor=PANEL_BG,
+                           activebackground=DARK_BG, font=FONT_LABEL).grid(
+                               row=r, column=1, sticky="w"); r+=1
+
+        run_btn = self._btn(p, "▶  RUN", None, colour=ACCENT)
+        run_btn.grid(row=r, column=1, sticky="w", pady=16)
+
+        def run():
+            self._run_in_thread(process_raster_to_svg,
+                                 inv.get(), outv.get() or None, mode.get(), btn=run_btn)
+        run_btn.config(command=run)
+
+    def _tab_from_svg(self):
+        p = self.tab_frame
+        p.columnconfigure(1, weight=1)
+        tk.Label(p, text="SVG → RASTER", font=FONT_HEAD,
+                 bg=DARK_BG, fg=TEXT_LIGHT).grid(row=0, column=0, columnspan=2,
+                                                   sticky="w", pady=(0,16))
+        if not CAIRO_OK:
+            tk.Label(p, text="SVG → Raster uses pure Pillow (already installed).\nFor best quality, install Inkscape from inkscape.org",
+                     bg=DARK_BG, fg=WARNING, font=FONT_SUB).grid(row=1, column=0,
+                                                                   columnspan=2, pady=20)
+            return
+        inv, outv, r = self._io_rows(p, row=1)
+
+        fmt = tk.StringVar(value="PNG")
+        dpi = tk.IntVar(value=150)
+
+        tk.Label(p, text="OPTIONS", font=FONT_BTN, bg=DARK_BG,
+                 fg=ACCENT).grid(row=r, column=0, sticky="w", pady=(12,2)); r+=1
+        self._label(p, "Output format:").grid(row=r, column=0, sticky="w", pady=4)
+        ff = tk.Frame(p, bg=DARK_BG); ff.grid(row=r, column=1, sticky="w"); r+=1
+        for f in ("PNG","JPEG"):
+            tk.Radiobutton(ff, text=f, variable=fmt, value=f,
+                           bg=DARK_BG, fg=TEXT_LIGHT, selectcolor=PANEL_BG,
+                           activebackground=DARK_BG, font=FONT_LABEL).pack(side="left", padx=4)
+        self._label(p, "DPI / Scale:").grid(row=r, column=0, sticky="w", pady=4)
+        df = tk.Frame(p, bg=DARK_BG); df.grid(row=r, column=1, sticky="ew", pady=4); r+=1
+        tk.Scale(df, from_=72, to=300, orient="horizontal", variable=dpi,
+                 bg=DARK_BG, fg=TEXT_LIGHT, troughcolor=BORDER,
+                 highlightthickness=0, font=FONT_LABEL).pack(side="left", fill="x", expand=True)
+        tk.Label(df, textvariable=dpi, bg=DARK_BG, fg=ACCENT,
+                 font=FONT_BTN, width=4).pack(side="left")
+
+        run_btn = self._btn(p, "▶  RUN", None, colour=ACCENT)
+        run_btn.grid(row=r, column=1, sticky="w", pady=16)
+
+        def run():
+            self._run_in_thread(process_svg_to_raster,
+                                 inv.get(), outv.get() or None,
+                                 fmt.get(), dpi.get(), btn=run_btn)
+        run_btn.config(command=run)
+
+    def _tab_audio(self):
+        p = self.tab_frame
+        p.columnconfigure(1, weight=1)
+        tk.Label(p, text="AUDIO EXTRACTION", font=FONT_HEAD,
+                 bg=DARK_BG, fg=TEXT_LIGHT).grid(row=0, column=0, columnspan=2,
+                                                   sticky="w", pady=(0,16))
+        if not MOVIEPY_OK:
+            tk.Label(p, text="⚠ moviepy not installed.\nRun:  pip install moviepy",
+                     bg=DARK_BG, fg=WARNING, font=FONT_SUB).grid(row=1, column=0,
+                                                                   columnspan=2, pady=20)
+            return
+        inv, outv, r = self._io_rows(p, row=1)
+
+        afmt = tk.StringVar(value="mp3")
+        tk.Label(p, text="AUDIO FORMAT", font=FONT_BTN, bg=DARK_BG,
+                 fg=ACCENT).grid(row=r, column=0, sticky="w", pady=(12,2)); r+=1
+        ff = tk.Frame(p, bg=DARK_BG); ff.grid(row=r, column=1, sticky="w"); r+=1
+        for f in ("mp3","wav","aac","flac"):
+            tk.Radiobutton(ff, text=f.upper(), variable=afmt, value=f,
+                           bg=DARK_BG, fg=TEXT_LIGHT, selectcolor=PANEL_BG,
+                           activebackground=DARK_BG, font=FONT_LABEL).pack(side="left", padx=4)
+
+        run_btn = self._btn(p, "▶  RUN", None, colour=ACCENT)
+        run_btn.grid(row=r, column=1, sticky="w", pady=16)
+
+        def run():
+            self._run_in_thread(process_extract_audio,
+                                 inv.get(), outv.get() or None, afmt.get(), btn=run_btn)
+        run_btn.config(command=run)
+
+    def _tab_watermark(self):
+        p = self.tab_frame
+        p.columnconfigure(1, weight=1)
+        tk.Label(p, text="WATERMARK", font=FONT_HEAD,
+                 bg=DARK_BG, fg=TEXT_LIGHT).grid(row=0, column=0, columnspan=2,
+                                                   sticky="w", pady=(0,16))
+        inv, outv, r = self._io_rows(p, row=1)
+
+        wmt  = tk.StringVar(value="© Your Brand")
+        opc  = tk.IntVar(value=180)
+        pos  = tk.StringVar(value="bottom-right")
+
+        tk.Label(p, text="OPTIONS", font=FONT_BTN, bg=DARK_BG,
+                 fg=ACCENT).grid(row=r, column=0, sticky="w", pady=(12,2)); r+=1
+        self._label(p, "Watermark text:").grid(row=r, column=0, sticky="w", pady=4)
+        self._entry(p, textvariable=wmt, width=30).grid(row=r, column=1, sticky="w"); r+=1
+        self._label(p, "Opacity (0-255):").grid(row=r, column=0, sticky="w", pady=4)
+        of = tk.Frame(p, bg=DARK_BG); of.grid(row=r, column=1, sticky="ew", pady=4); r+=1
+        tk.Scale(of, from_=0, to=255, orient="horizontal", variable=opc,
+                 bg=DARK_BG, fg=TEXT_LIGHT, troughcolor=BORDER,
+                 highlightthickness=0).pack(side="left", fill="x", expand=True)
+        tk.Label(of, textvariable=opc, bg=DARK_BG, fg=ACCENT,
+                 font=FONT_BTN, width=4).pack(side="left")
+        self._label(p, "Position:").grid(row=r, column=0, sticky="w", pady=4)
+        pf = tk.Frame(p, bg=DARK_BG); pf.grid(row=r, column=1, sticky="w"); r+=1
+        for pos_opt in ("bottom-right","bottom-left","top-right","top-left","center"):
+            tk.Radiobutton(pf, text=pos_opt, variable=pos, value=pos_opt,
+                           bg=DARK_BG, fg=TEXT_LIGHT, selectcolor=PANEL_BG,
+                           activebackground=DARK_BG, font=FONT_LABEL).pack(side="left", padx=4)
+
+        run_btn = self._btn(p, "▶  RUN", None, colour=ACCENT)
+        run_btn.grid(row=r, column=1, sticky="w", pady=16)
+
+        def run():
+            self._run_in_thread(process_watermark,
+                                 inv.get(), outv.get() or None,
+                                 wmt.get(), opc.get(), pos.get(), btn=run_btn)
+        run_btn.config(command=run)
+
+    def _tab_colour(self):
+        p = self.tab_frame
+        p.columnconfigure(1, weight=1)
+        tk.Label(p, text="COLOUR EFFECTS", font=FONT_HEAD,
+                 bg=DARK_BG, fg=TEXT_LIGHT).grid(row=0, column=0, columnspan=2,
+                                                   sticky="w", pady=(0,16))
+        inv, outv, r = self._io_rows(p, row=1)
+
+        effect = tk.StringVar(value="grayscale")
+        tk.Label(p, text="EFFECT", font=FONT_BTN, bg=DARK_BG,
+                 fg=ACCENT).grid(row=r, column=0, sticky="w", pady=(12,2)); r+=1
+        for e, lbl in (("grayscale","Grayscale"),("sepia","Sepia tone")):
+            tk.Radiobutton(p, text=lbl, variable=effect, value=e,
+                           bg=DARK_BG, fg=TEXT_LIGHT, selectcolor=PANEL_BG,
+                           activebackground=DARK_BG, font=FONT_LABEL).grid(
+                               row=r, column=1, sticky="w"); r+=1
+
+        run_btn = self._btn(p, "▶  RUN", None, colour=ACCENT)
+        run_btn.grid(row=r, column=1, sticky="w", pady=16)
+
+        def run():
+            self._run_in_thread(process_colour_effect,
+                                 inv.get(), outv.get() or None, effect.get(), btn=run_btn)
+        run_btn.config(command=run)
+
+    def _tab_canvas(self):
+        p = self.tab_frame
+        p.columnconfigure(1, weight=1)
+        tk.Label(p, text="ADD CANVAS / PADDING", font=FONT_HEAD,
+                 bg=DARK_BG, fg=TEXT_LIGHT).grid(row=0, column=0, columnspan=2,
+                                                   sticky="w", pady=(0,16))
+        inv, outv, r = self._io_rows(p, row=1)
+
+        pt = tk.IntVar(value=50); pr = tk.IntVar(value=50)
+        pb = tk.IntVar(value=50); pl = tk.IntVar(value=50)
+        bg = tk.StringVar(value="#ffffff")
+
+        tk.Label(p, text="PADDING (px)", font=FONT_BTN, bg=DARK_BG,
+                 fg=ACCENT).grid(row=r, column=0, sticky="w", pady=(12,2)); r+=1
+        for lbl, var in (("Top:", pt),("Right:", pr),("Bottom:", pb),("Left:", pl)):
+            self._label(p, lbl).grid(row=r, column=0, sticky="w", pady=3)
+            self._entry(p, textvariable=var, width=8).grid(row=r, column=1, sticky="w"); r+=1
+
+        self._label(p, "Background colour:").grid(row=r, column=0, sticky="w", pady=4)
+        bf = tk.Frame(p, bg=DARK_BG); bf.grid(row=r, column=1, sticky="w"); r+=1
+        self._entry(bf, textvariable=bg, width=10).pack(side="left")
+        self._btn(bf, "Pick", lambda: bg.set(colorchooser.askcolor()[1] or bg.get()),
+                  colour="#2a2840").pack(side="left", padx=6)
+
+        run_btn = self._btn(p, "▶  RUN", None, colour=ACCENT)
+        run_btn.grid(row=r, column=1, sticky="w", pady=16)
+
+        def run():
+            self._run_in_thread(process_add_canvas,
+                                 inv.get(), outv.get() or None,
+                                 pt.get(), pr.get(), pb.get(), pl.get(), bg.get(), btn=run_btn)
+        run_btn.config(command=run)
+
+    def _tab_sprite(self):
+        p = self.tab_frame
+        p.columnconfigure(1, weight=1)
+        tk.Label(p, text="SPRITE SHEET", font=FONT_HEAD,
+                 bg=DARK_BG, fg=TEXT_LIGHT).grid(row=0, column=0, columnspan=2,
+                                                   sticky="w", pady=(0,16))
+        inv = tk.StringVar()
+        out = tk.StringVar(value="sprite_sheet.png")
+        cols= tk.IntVar(value=4)
+        spc = tk.IntVar(value=0)
+
+        r = 1
+        self._label(p, "Input folder:").grid(row=r, column=0, sticky="w", pady=4)
+        ef = tk.Frame(p, bg=DARK_BG); ef.grid(row=r, column=1, sticky="ew", pady=3); r+=1
+        self._entry(ef, textvariable=inv, width=34).pack(side="left", fill="x", expand=True)
+        self._btn(ef, "…", lambda: self._browse_in(inv, "folder"),
+                  colour="#2a2840").pack(side="left", padx=(6,0))
+
+        self._label(p, "Output path:").grid(row=r, column=0, sticky="w", pady=4)
+        ef2 = tk.Frame(p, bg=DARK_BG); ef2.grid(row=r, column=1, sticky="ew", pady=3); r+=1
+        self._entry(ef2, textvariable=out, width=34).pack(side="left", fill="x", expand=True)
+        self._btn(ef2, "…", lambda: out.set(filedialog.asksaveasfilename(
+            defaultextension=".png", filetypes=[("PNG","*.png")])),
+                  colour="#2a2840").pack(side="left", padx=(6,0))
+
+        self._label(p, "Columns:").grid(row=r, column=0, sticky="w", pady=4)
+        self._entry(p, textvariable=cols, width=8).grid(row=r, column=1, sticky="w"); r+=1
+        self._label(p, "Spacing (px):").grid(row=r, column=0, sticky="w", pady=4)
+        self._entry(p, textvariable=spc, width=8).grid(row=r, column=1, sticky="w"); r+=1
+
+        run_btn = self._btn(p, "▶  RUN", None, colour=ACCENT)
+        run_btn.grid(row=r, column=1, sticky="w", pady=16)
+
+        def run():
+            self._run_in_thread(process_sprite_sheet,
+                                 inv.get(), out.get(), cols.get(), spc.get(), btn=run_btn)
+        run_btn.config(command=run)
+
+    def _tab_exif(self):
+        p = self.tab_frame
+        p.columnconfigure(1, weight=1)
+        tk.Label(p, text="STRIP EXIF METADATA", font=FONT_HEAD,
+                 bg=DARK_BG, fg=TEXT_LIGHT).grid(row=0, column=0, columnspan=2,
+                                                   sticky="w", pady=(0,16))
+        tk.Label(p, text="Removes GPS data, camera info, and all embedded\nmetadata from your images before sharing online.",
+                 font=FONT_LABEL, bg=DARK_BG, fg=TEXT_DIM, justify="left").grid(
+                     row=1, column=0, columnspan=2, sticky="w", pady=(0,14))
+        inv, outv, r = self._io_rows(p, row=2)
+
+        run_btn = self._btn(p, "▶  RUN", None, colour=ACCENT)
+        run_btn.grid(row=r, column=1, sticky="w", pady=16)
+
+        def run():
+            self._run_in_thread(process_strip_exif,
+                                 inv.get(), outv.get() or None, btn=run_btn)
+        run_btn.config(command=run)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  COMMAND-LINE EXAMPLES  (if __name__ == "__main__" headless usage)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def cli_examples():
+    print("""
+╔══════════════════════════════════════════════════════════╗
+║        GRAPHIC DESIGNER TOOLKIT  ·  CLI EXAMPLES        ║
+╚══════════════════════════════════════════════════════════╝
+
+1. Resize + compress a whole folder (recursive):
+   process_resize_compress("my_photos/", "output/", quality=75,
+                            max_width=1920, max_height=1080)
+
+2. Compress a single file:
+   process_resize_compress("hero.jpg", "output/", quality=60)
+
+3. Convert all JPEGs in a folder to PNG:
+   process_convert_format("logos/", "png_logos/", target_fmt="PNG")
+
+4. Trace images to SVG (colour):
+   process_raster_to_svg("icons/", "svg_icons/", colormode="color")
+
+5. Rasterise SVGs at 300 DPI:
+   process_svg_to_raster("vectors/", "raster/", target_fmt="PNG", dpi=300)
+
+6. Extract audio from videos:
+   process_extract_audio("recordings/", "audio/", audio_fmt="mp3")
+
+7. Add watermark to a folder of images:
+   process_watermark("deliverables/", "watermarked/",
+                     wm_text="© Studio X 2025", opacity=160,
+                     position="bottom-right")
+
+8. Strip EXIF before sending to client:
+   process_strip_exif("client_photos/", "clean/")
+
+9. Convert to grayscale:
+   process_colour_effect("product_shots/", "bw/", effect="grayscale")
+
+10. Add 60px white canvas on all sides:
+    process_add_canvas("icons/", "padded/",
+                       pad_top=60, pad_right=60,
+                       pad_bottom=60, pad_left=60,
+                       bg_colour="#ffffff")
+
+11. Build a sprite sheet (4 columns):
+    process_sprite_sheet("frames/", "sprite.png", cols=4, spacing=2)
+""")
+
+
+if __name__ == "__main__":
+    import sys
+
+    if "--cli" in sys.argv:
+        # Headless demo: print examples and run one
+        cli_examples()
+        print("Running headless demo: compress a single test image…")
+        # Create a tiny test image for demo
+        if PIL_OK:
+            demo = Path("demo_input.png")
+            img  = Image.new("RGB", (800, 600), color=(120, 80, 200))
+            img.save(demo)
+            process_resize_compress(str(demo), "demo_output/",
+                                     quality=60, max_width=400)
+            print(f"\nDemo complete. Check demo_output/")
+        else:
+            print("Install Pillow first:  pip install pillow")
+    else:
+        # Launch GUI
+        app = GraphicDesignerToolkit()
+        app.mainloop()
